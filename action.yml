@@ -1,0 +1,181 @@
+name: 'SitePong Trigger Build'
+description: 'Trigger native iOS/Android builds on SitePong using GitHub OIDC trusted publishing (no API key needed)'
+
+inputs:
+  project-id:
+    description: 'SitePong project ID'
+    required: true
+  platform:
+    description: 'Target platform (ios or android)'
+    default: 'ios'
+  build-type:
+    description: 'Build type (testflight or appstore)'
+    default: 'testflight'
+  app-version:
+    description: 'App version (e.g. 1.0.0)'
+    required: true
+  changelog:
+    description: 'Changelog for this build'
+    required: true
+  branch:
+    description: 'Branch to build from'
+    default: ''
+  working-directory:
+    description: 'Path to the app root within the repo'
+    default: '.'
+  credential-name:
+    description: 'Name of the Apple credential to use (uses first available if omitted)'
+    default: ''
+  distribute-internal:
+    description: 'Distribute to internal TestFlight testers'
+    default: 'false'
+  external-groups:
+    description: 'Comma-separated list of external TestFlight group names (e.g. "Beta Testers,External Twins")'
+    default: ''
+  wait-for-build:
+    description: 'Wait for the build to complete before finishing'
+    default: 'false'
+  wait-timeout:
+    description: 'Max minutes to wait for build completion (only used when wait-for-build is true)'
+    default: '60'
+  updates-url:
+    description: 'SitePong updates server URL'
+    default: 'https://updates.sitepong.com'
+
+outputs:
+  build-id:
+    description: 'The build ID'
+    value: ${{ steps.trigger.outputs.build_id }}
+  build-number:
+    description: 'The build number'
+    value: ${{ steps.trigger.outputs.build_number }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Get OIDC token
+      id: oidc
+      shell: bash
+      run: |
+        OIDC_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${{ inputs.updates-url }}" | jq -r '.value')
+        if [ "$OIDC_TOKEN" = "null" ] || [ -z "$OIDC_TOKEN" ]; then
+          echo "::error::Failed to get OIDC token. Ensure 'permissions: id-token: write' is set."
+          exit 1
+        fi
+        echo "::add-mask::$OIDC_TOKEN"
+        echo "token=$OIDC_TOKEN" >> "$GITHUB_OUTPUT"
+
+    - name: Exchange for publish token
+      id: exchange
+      shell: bash
+      run: |
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${{ inputs.updates-url }}/token/exchange" \
+          -H "Content-Type: application/json" \
+          -d "{\"oidc_token\": \"${{ steps.oidc.outputs.token }}\", \"project_id\": \"${{ inputs.project-id }}\"}")
+        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+        BODY=$(echo "$RESPONSE" | sed '$d')
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "::error::Token exchange failed ($HTTP_CODE): $BODY"
+          exit 1
+        fi
+        PUBLISH_TOKEN=$(echo "$BODY" | jq -r '.token')
+        echo "::add-mask::$PUBLISH_TOKEN"
+        echo "token=$PUBLISH_TOKEN" >> "$GITHUB_OUTPUT"
+
+    - name: Trigger build
+      id: trigger
+      shell: bash
+      run: |
+        BRANCH="${{ inputs.branch }}"
+        if [ -z "$BRANCH" ]; then
+          BRANCH="${GITHUB_REF#refs/heads/}"
+        fi
+
+        BODY=$(jq -n \
+          --arg platform "${{ inputs.platform }}" \
+          --arg branch "$BRANCH" \
+          --arg build_type "${{ inputs.build-type }}" \
+          --arg working_directory "${{ inputs.working-directory }}" \
+          --arg app_version "${{ inputs.app-version }}" \
+          --arg changelog "${{ inputs.changelog }}" \
+          '{platform: $platform, branch: $branch, build_type: $build_type, working_directory: $working_directory, app_version: $app_version, changelog: $changelog}')
+
+        # Add credential_name if provided
+        if [ -n "${{ inputs.credential-name }}" ]; then
+          BODY=$(echo "$BODY" | jq --arg cn "${{ inputs.credential-name }}" '. + {credential_name: $cn}')
+        fi
+
+        # Add distribute_internal if true
+        if [ "${{ inputs.distribute-internal }}" = "true" ]; then
+          BODY=$(echo "$BODY" | jq '. + {distribute_internal: true}')
+        fi
+
+        # Add testflight_groups from external-groups (comma-separated → JSON array)
+        if [ -n "${{ inputs.external-groups }}" ]; then
+          BODY=$(echo "$BODY" | jq --arg groups "${{ inputs.external-groups }}" '. + {testflight_groups: ($groups | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')
+        fi
+
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${{ inputs.updates-url }}/build/trigger" \
+          -H "Authorization: Bearer ${{ steps.exchange.outputs.token }}" \
+          -H "Content-Type: application/json" \
+          -d "$BODY")
+
+        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+        RESP_BODY=$(echo "$RESPONSE" | sed '$d')
+
+        if [ "$HTTP_CODE" != "201" ]; then
+          echo "::error::Build trigger failed ($HTTP_CODE): $RESP_BODY"
+          exit 1
+        fi
+
+        BUILD_ID=$(echo "$RESP_BODY" | jq -r '.build_id')
+        BUILD_NUMBER=$(echo "$RESP_BODY" | jq -r '.build_number')
+        echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+        echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+        echo "Build #$BUILD_NUMBER triggered (ID: $BUILD_ID)"
+
+    - name: Wait for build
+      if: inputs.wait-for-build == 'true'
+      shell: bash
+      run: |
+        BUILD_ID="${{ steps.trigger.outputs.build_id }}"
+        TIMEOUT_MIN="${{ inputs.wait-timeout }}"
+        DEADLINE=$(($(date +%s) + TIMEOUT_MIN * 60))
+        echo "Waiting for build $BUILD_ID (timeout: ${TIMEOUT_MIN}m)..."
+
+        while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+          sleep 30
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            "${{ inputs.updates-url }}/build/status/$BUILD_ID" \
+            -H "Authorization: Bearer ${{ steps.exchange.outputs.token }}")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::warning::Status check failed ($HTTP_CODE), retrying..."
+            continue
+          fi
+
+          STATUS=$(echo "$BODY" | jq -r '.status')
+          echo "Build status: $STATUS"
+
+          case "$STATUS" in
+            completed)
+              echo "Build completed successfully!"
+              exit 0
+              ;;
+            failed)
+              ERROR=$(echo "$BODY" | jq -r '.error_message // "Unknown error"')
+              echo "::error::Build failed: $ERROR"
+              exit 1
+              ;;
+            cancelled)
+              echo "::error::Build was cancelled"
+              exit 1
+              ;;
+          esac
+        done
+
+        echo "::error::Build timed out after ${TIMEOUT_MIN} minutes"
+        exit 1
