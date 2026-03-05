@@ -26,9 +26,9 @@ inputs:
   credential-name:
     description: 'Name of the Apple credential to use (uses first available if omitted)'
     default: ''
-  distribute-internal:
-    description: 'Distribute to internal TestFlight testers'
-    default: 'false'
+  internal-groups:
+    description: 'Comma-separated list of internal TestFlight group names (e.g. "App Store Connect Users,Developers")'
+    default: ''
   external-groups:
     description: 'Comma-separated list of external TestFlight group names (e.g. "Beta Testers,External Twins")'
     default: ''
@@ -106,14 +106,14 @@ runs:
           BODY=$(echo "$BODY" | jq --arg cn "${{ inputs.credential-name }}" '. + {credential_name: $cn}')
         fi
 
-        # Add distribute_internal if true
-        if [ "${{ inputs.distribute-internal }}" = "true" ]; then
-          BODY=$(echo "$BODY" | jq '. + {distribute_internal: true}')
+        # Add internal-groups (comma-separated → JSON array)
+        if [ -n "${{ inputs.internal-groups }}" ]; then
+          BODY=$(echo "$BODY" | jq --arg groups "${{ inputs.internal-groups }}" '. + {internal_groups: ($groups | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')
         fi
 
-        # Add testflight_groups from external-groups (comma-separated → JSON array)
+        # Add external-groups (comma-separated → JSON array)
         if [ -n "${{ inputs.external-groups }}" ]; then
-          BODY=$(echo "$BODY" | jq --arg groups "${{ inputs.external-groups }}" '. + {testflight_groups: ($groups | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')
+          BODY=$(echo "$BODY" | jq --arg groups "${{ inputs.external-groups }}" '. + {external_groups: ($groups | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')
         fi
 
         RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${{ inputs.updates-url }}/build/trigger" \
