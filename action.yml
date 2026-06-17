@@ -12,7 +12,7 @@ inputs:
     description: 'Build type (testflight or appstore)'
     default: 'testflight'
   app-version:
-    description: 'App version (e.g. 1.0.0)'
+    description: 'App version (e.g. 1.0.0), or "date" to auto-generate a YYYY.MM.DD version at build time'
     required: true
   changelog:
     description: 'Changelog for this build'
@@ -56,9 +56,11 @@ runs:
     - name: Get OIDC token
       id: oidc
       shell: bash
+      env:
+        UPDATES_URL: ${{ inputs.updates-url }}
       run: |
         OIDC_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${{ inputs.updates-url }}" | jq -r '.value')
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${UPDATES_URL}" | jq -r '.value')
         if [ "$OIDC_TOKEN" = "null" ] || [ -z "$OIDC_TOKEN" ]; then
           echo "::error::Failed to get OIDC token. Ensure 'permissions: id-token: write' is set."
           exit 1
@@ -69,10 +71,18 @@ runs:
     - name: Exchange for publish token
       id: exchange
       shell: bash
+      env:
+        UPDATES_URL: ${{ inputs.updates-url }}
+        OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        PROJECT_ID: ${{ inputs.project-id }}
       run: |
-        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${{ inputs.updates-url }}/token/exchange" \
+        # Build the request body with jq so the values are JSON-encoded safely,
+        # never interpolated into the shell or a JSON string literal.
+        REQ=$(jq -n --arg t "$OIDC_TOKEN" --arg p "$PROJECT_ID" \
+          '{oidc_token: $t, project_id: $p}')
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${UPDATES_URL}/token/exchange" \
           -H "Content-Type: application/json" \
-          -d "{\"oidc_token\": \"${{ steps.oidc.outputs.token }}\", \"project_id\": \"${{ inputs.project-id }}\"}")
+          -d "$REQ")
         HTTP_CODE=$(echo "$RESPONSE" | tail -1)
         BODY=$(echo "$RESPONSE" | sed '$d')
         if [ "$HTTP_CODE" != "200" ]; then
@@ -86,38 +96,54 @@ runs:
     - name: Trigger build
       id: trigger
       shell: bash
+      env:
+        UPDATES_URL: ${{ inputs.updates-url }}
+        PUBLISH_TOKEN: ${{ steps.exchange.outputs.token }}
+        # All user-controlled inputs are passed via env (never interpolated into
+        # the script) so commit messages / changelogs with quotes, backticks,
+        # parentheses, newlines, etc. can't break the shell or jq, and can't be
+        # used for script injection. jq --arg JSON-encodes them safely.
+        INPUT_PLATFORM: ${{ inputs.platform }}
+        INPUT_BRANCH: ${{ inputs.branch }}
+        INPUT_BUILD_TYPE: ${{ inputs.build-type }}
+        INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        INPUT_APP_VERSION: ${{ inputs.app-version }}
+        INPUT_CHANGELOG: ${{ inputs.changelog }}
+        INPUT_CREDENTIAL_NAME: ${{ inputs.credential-name }}
+        INPUT_INTERNAL_GROUPS: ${{ inputs.internal-groups }}
+        INPUT_EXTERNAL_GROUPS: ${{ inputs.external-groups }}
       run: |
-        BRANCH="${{ inputs.branch }}"
+        BRANCH="$INPUT_BRANCH"
         if [ -z "$BRANCH" ]; then
           BRANCH="${GITHUB_REF#refs/heads/}"
         fi
 
         BODY=$(jq -n \
-          --arg platform "${{ inputs.platform }}" \
+          --arg platform "$INPUT_PLATFORM" \
           --arg branch "$BRANCH" \
-          --arg build_type "${{ inputs.build-type }}" \
-          --arg working_directory "${{ inputs.working-directory }}" \
-          --arg app_version "${{ inputs.app-version }}" \
-          --arg changelog "${{ inputs.changelog }}" \
+          --arg build_type "$INPUT_BUILD_TYPE" \
+          --arg working_directory "$INPUT_WORKING_DIRECTORY" \
+          --arg app_version "$INPUT_APP_VERSION" \
+          --arg changelog "$INPUT_CHANGELOG" \
           '{platform: $platform, branch: $branch, build_type: $build_type, working_directory: $working_directory, app_version: $app_version, changelog: $changelog}')
 
         # Add credential_name if provided
-        if [ -n "${{ inputs.credential-name }}" ]; then
-          BODY=$(echo "$BODY" | jq --arg cn "${{ inputs.credential-name }}" '. + {credential_name: $cn}')
+        if [ -n "$INPUT_CREDENTIAL_NAME" ]; then
+          BODY=$(echo "$BODY" | jq --arg cn "$INPUT_CREDENTIAL_NAME" '. + {credential_name: $cn}')
         fi
 
         # Add internal-groups (comma-separated → JSON array)
-        if [ -n "${{ inputs.internal-groups }}" ]; then
-          BODY=$(echo "$BODY" | jq --arg groups "${{ inputs.internal-groups }}" '. + {internal_groups: ($groups | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')
+        if [ -n "$INPUT_INTERNAL_GROUPS" ]; then
+          BODY=$(echo "$BODY" | jq --arg groups "$INPUT_INTERNAL_GROUPS" '. + {internal_groups: ($groups | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')
         fi
 
         # Add external-groups (comma-separated → JSON array)
-        if [ -n "${{ inputs.external-groups }}" ]; then
-          BODY=$(echo "$BODY" | jq --arg groups "${{ inputs.external-groups }}" '. + {external_groups: ($groups | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')
+        if [ -n "$INPUT_EXTERNAL_GROUPS" ]; then
+          BODY=$(echo "$BODY" | jq --arg groups "$INPUT_EXTERNAL_GROUPS" '. + {external_groups: ($groups | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')
         fi
 
-        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${{ inputs.updates-url }}/build/trigger" \
-          -H "Authorization: Bearer ${{ steps.exchange.outputs.token }}" \
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${UPDATES_URL}/build/trigger" \
+          -H "Authorization: Bearer $PUBLISH_TOKEN" \
           -H "Content-Type: application/json" \
           -d "$BODY")
 
@@ -138,19 +164,57 @@ runs:
     - name: Wait for build
       if: inputs.wait-for-build == 'true'
       shell: bash
+      env:
+        UPDATES_URL: ${{ inputs.updates-url }}
+        PROJECT_ID: ${{ inputs.project-id }}
+        BUILD_ID: ${{ steps.trigger.outputs.build_id }}
+        TIMEOUT_MIN: ${{ inputs.wait-timeout }}
+        PUBLISH_TOKEN: ${{ steps.exchange.outputs.token }}
       run: |
-        BUILD_ID="${{ steps.trigger.outputs.build_id }}"
-        TIMEOUT_MIN="${{ inputs.wait-timeout }}"
+        # The publish token is short-lived (~15m), but iOS builds routinely take
+        # longer. Re-mint a fresh token (OIDC → exchange) whenever a status poll
+        # comes back 401 so the wait loop survives the full build instead of
+        # silently timing out after the token expires.
+        mint_token() {
+          local oidc resp code body req
+          oidc=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${UPDATES_URL}" | jq -r '.value')
+          if [ "$oidc" = "null" ] || [ -z "$oidc" ]; then
+            echo "::warning::Token refresh: could not obtain OIDC token" >&2
+            return 1
+          fi
+          req=$(jq -n --arg t "$oidc" --arg p "$PROJECT_ID" '{oidc_token: $t, project_id: $p}')
+          resp=$(curl -s -w "\n%{http_code}" -X POST "${UPDATES_URL}/token/exchange" \
+            -H "Content-Type: application/json" -d "$req")
+          code=$(echo "$resp" | tail -1)
+          body=$(echo "$resp" | sed '$d')
+          if [ "$code" != "200" ]; then
+            echo "::warning::Token refresh failed ($code)" >&2
+            return 1
+          fi
+          echo "$body" | jq -r '.token'
+        }
+
         DEADLINE=$(($(date +%s) + TIMEOUT_MIN * 60))
         echo "Waiting for build $BUILD_ID (timeout: ${TIMEOUT_MIN}m)..."
 
         while [ "$(date +%s)" -lt "$DEADLINE" ]; do
           sleep 30
           RESPONSE=$(curl -s -w "\n%{http_code}" \
-            "${{ inputs.updates-url }}/build/status/$BUILD_ID" \
-            -H "Authorization: Bearer ${{ steps.exchange.outputs.token }}")
+            "${UPDATES_URL}/build/status/$BUILD_ID" \
+            -H "Authorization: Bearer $PUBLISH_TOKEN")
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           BODY=$(echo "$RESPONSE" | sed '$d')
+
+          # Token likely expired — re-mint and retry on the next poll.
+          if [ "$HTTP_CODE" = "401" ]; then
+            echo "Publish token expired, refreshing..."
+            if NEW_TOKEN=$(mint_token); then
+              PUBLISH_TOKEN="$NEW_TOKEN"
+              echo "::add-mask::$PUBLISH_TOKEN"
+            fi
+            continue
+          fi
 
           if [ "$HTTP_CODE" != "200" ]; then
             echo "::warning::Status check failed ($HTTP_CODE), retrying..."
